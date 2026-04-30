@@ -50,7 +50,7 @@ runner_cfg:
     # 【L2RCLIP 核心修改】切换为 L2RCLIP 的双重损失
     ce_loss: 1.0       # 对应 Asymmetrical Contrastive Loss (SupConLoss)
     kl_loss: 0.0       # 关闭原始 OrdinalCLIP 的 KL 散度损失
-    cop_loss: 1.0      # 【L2RCLIP 新增】对应 Cross-modal Ordinal Pairwise Loss (L_cop)
+    cop_loss: 1.5      # 【L2RCLIP 新增】对应 Cross-modal Ordinal Pairwise Loss (L_cop)
     mse_loss: 0.0
     
   model_cfg:

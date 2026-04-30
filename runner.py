@@ -10,10 +10,10 @@ import numpy as np
 sys.path.insert(0, '/home/ubuntu/lq/OrdinalCLIP')
 
 from ordinalclip.models import MODELS
-from ordinalclip.models.ordinalclip import OrdinalCLIP
+
 from ordinalclip.utils.logging import get_logger
 from ordinalclip.runner.optim.lr_scheduler import build_lr_scheduler
-from ordinalclip.runner.optim.optimizer import build_optimizer, build_staged_lr_param_groups
+from ordinalclip.runner.optim.optimizer import build_optimizer
 from ordinalclip.runner.utils import freeze_param, load_pretrained_weights
 
 import matplotlib.pyplot as plt
@@ -29,30 +29,80 @@ class L2RCLIPRunner(pl.LightningModule):
         optimizer_and_scheduler_cfg,
         load_weights_cfg,
         seed: int,
-        # 严格对应论文中的权重分配
-        loss_weights=dict(
-            ce_loss=1.0,    # Asymmetrical Contrastive Loss
-            cop_loss=1.0,   # Cross-modal Ordinal Pairwise Loss
-        ),
-        stage2_start_epoch=10, # 从 YAML 传入，控制何时解冻 Image Encoder
+        loss_weights=dict(ce_loss=1.0, cop_loss=1.0),
+        stage2_start_epoch=10, 
         ckpt_path="",
     ) -> None:
         super().__init__()
-        # 将参数保存到 self.hparams，确保 stage2_start_epoch 可读
         self.save_hyperparameters()
         
+        # 这里哪怕加载了旧的 OrdinalCLIP 也没关系
         self.module = MODELS.build(model_cfg)
         self.loss_weights = loss_weights
-        self.num_ranks = self.module.num_ranks  # 应为5（F0-F4）
+        self.num_ranks = getattr(self.module, "num_ranks", 5) 
+
+        # =====================================================================
+        # 🚀 终极自愈补丁：动态强行注入 L2RPromptLearner (无视路径冲突)
+        # =====================================================================
+        if not hasattr(self.module.prompt_learner, "rankformer"):
+            logger.warning("⚠️ 检测到模型加载了旧版 PromptLearner，正在启动动态替换...")
+            
+            # 1. 确保能从你当前的新项目里导入 L2RPromptLearner
+            import sys
+            if '/home/ubuntu/lq/L2RCLIP' not in sys.path:
+                sys.path.append('/home/ubuntu/lq/L2RCLIP')
+            from models.prompt_learner import L2RPromptLearner
+            
+            # 2. 抓取底层的 CLIP 实例和特征维度
+            internal_clip = getattr(self.module, "clip_model", getattr(self.module, "model", None))
+            
+            # 👇 【关键新增：防丢机制】如果旧模型把它丢了，我们当场加载一个用来提取词向量
+            if internal_clip is None:
+                import clip
+                # 尝试从配置获取 backbone 名字，默认兜底使用 ViT-B/16
+                backbone_name = model_cfg.get("text_encoder_name", "ViT-B/16")
+                logger.info(f"🔄 旧版代码未保存 CLIP 实例，正从本地缓存加载 {backbone_name} 提取医学词嵌入...")
+                internal_clip, _ = clip.load(backbone_name, device="cpu")
+                internal_clip.float() # 保持数据类型一致
+            # 👆 =======================================================================
+            
+            embed_dims = getattr(self.module, "embed_dims", 512)
+            
+            # 3. 强行覆盖为你的医学医学先验学习器
+            self.module.prompt_learner = L2RPromptLearner(
+                clip_model=internal_clip, 
+                num_ranks=self.num_ranks, 
+                embeddings_dim=embed_dims
+            )
+            
+            # 4. 同步 Token 供外部 TextEncoder 提取句尾 [EOT]
+            self.module.psudo_sentence_tokens = self.module.prompt_learner.psudo_sentence_tokens
+            
+            # 5. 动态截断 TextEncoder 的位置编码 (解决 17 vs 77 的 RuntimeError)
+            seq_len = self.module.psudo_sentence_tokens.shape[1]
+            orig_pos = self.module.text_encoder.positional_embedding
+            if orig_pos.shape[0] != seq_len:
+                logger.info(f"✂️ 正在动态截断位置编码 ({orig_pos.shape[0]} -> {seq_len}) 以完美匹配医学 Prompt...")
+                self.module.text_encoder.positional_embedding = torch.nn.Parameter(
+                    orig_pos[:seq_len, :].clone()
+                )
+#                👇 【关键新增：解决 77x77 报错】同步截断所有 Transformer 层的 Attention Mask
+                if hasattr(self.module.text_encoder, "transformer"):
+                    for block in self.module.text_encoder.transformer.resblocks:
+                        if hasattr(block, "attn_mask") and block.attn_mask is not None:
+                            block.attn_mask = block.attn_mask[:seq_len, :seq_len]
+                # 👆 ===============================================================
+                
+            logger.info("✅ 动态替换成功！RankFormer 和医学先验 (F0-F4) 已全副武装上线。")
+        else:
+            logger.info("✅ 原生装配成功！已检测到 RankFormer。")
+        # =====================================================================
         
-        # 注册用于计算期待值的常量数组
         self.register_buffer("rank_output_value_array", torch.arange(0, self.num_ranks).float(), persistent=False)
         self.output_dir = Path(output_dir)
         self._custom_logger = get_logger(__name__)
 
-        # 初始化测试预测结果存储列表
-        self.test_predictions: List[Dict[str, Any]] = []
-
+        self.test_predictions = []
         self.load_weights(**load_weights_cfg)
         self._optimizer_and_scheduler_cfg = optimizer_and_scheduler_cfg
         self.seed = seed
@@ -247,18 +297,18 @@ class L2RCLIPRunner(pl.LightningModule):
     def build_param_dict(self, **kwargs):
         param_dict_ls = []
         
-        # 1. 提示词上下文参数（增加属性存在性检查）
+        # 1. 提示词上下文参数
         if kwargs.get("lr_prompt_learner_context", 0) > 0 and hasattr(self.module.prompt_learner, "context_embeds"):
             param_dict_ls.append({
-                "params": self.module.prompt_learner.context_embeds, 
+                "params": [self.module.prompt_learner.context_embeds], # ✅ 加上 []
                 "lr": kwargs["lr_prompt_learner_context"], 
                 "name": "prompt_context"
             })
         
-        # 2. 基础等级嵌入参数（增加属性存在性检查）
+        # 2. 基础等级嵌入参数
         if kwargs.get("lr_prompt_learner_ranks", 0) > 0 and hasattr(self.module.prompt_learner, "rank_embeds"):
             param_dict_ls.append({
-                "params": self.module.prompt_learner.rank_embeds, 
+                "params": [self.module.prompt_learner.rank_embeds], # ✅ 加上 []
                 "lr": kwargs["lr_prompt_learner_ranks"], 
                 "name": "prompt_ranks"
             })

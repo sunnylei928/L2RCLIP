@@ -1,6 +1,7 @@
 import os
 import re
-
+import torch
+torch.set_float32_matmul_precision('medium') # 开启 L40 显卡的狂暴加速模式
 # 定义基础路径
 results_dir = "/home/ubuntu/lq/L2RCLIP_results" # 建议换个独立文件夹存放 L2RCLIP 的结果
 kfold_dir = "/home/ubuntu/lq/OrdinalCLIP/data/data_list/kfold"
