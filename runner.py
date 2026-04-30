@@ -3,11 +3,10 @@ from pathlib import Path
 import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
-from torch import nn
 import sys
 import pandas as pd
 from typing import Dict, List, Any
-
+import numpy as np
 sys.path.insert(0, '/home/ubuntu/lq/OrdinalCLIP')
 
 from ordinalclip.models import MODELS
@@ -141,27 +140,31 @@ class L2RCLIPRunner(pl.LightningModule):
         :param logits: 模型输出的原始logits
         :param y: 真实标签
         """
-        # 计算F0-F4的概率分布
-        probs = F.softmax(logits, dim=-1).detach().cpu().numpy()  # [batch_size, 5]
-        # 计算期望预测值（pred_exp）和 argmax 预测值（pred_max）
+        # 1. 纯 Tensor 计算阶段（速度最快，全在同一设备上运算）
+        probs_tensor = F.softmax(logits, dim=-1)  # 保持为 Tensor
         rank_values = self.rank_output_value_array.type(logits.dtype)
-        pred_exp = torch.sum(probs * rank_values, dim=-1).detach().cpu().numpy()
-        pred_max = torch.argmax(logits, dim=-1).detach().cpu().numpy()
-        # 真实标签转numpy
-        true_label = y.cpu().numpy()
+        
+        pred_exp_tensor = torch.sum(probs_tensor * rank_values, dim=-1)
+        pred_max_tensor = torch.argmax(logits, dim=-1)
+        
+        # 2. 统一转换为 Numpy 阶段（准备提取纯数字）
+        probs_np = probs_tensor.detach().cpu().numpy()
+        pred_exp_np = pred_exp_tensor.detach().cpu().numpy()
+        pred_max_np = pred_max_tensor.detach().cpu().numpy()
+        true_label_np = y.detach().cpu().numpy()
 
-        # 逐样本收集数据（兼容批量）
-        for idx in range(len(true_label)):
+        # 3. 逐样本收集数据
+        for idx in range(len(true_label_np)):
             pred_dict = {
-                "true_label": true_label[idx],
-                "pred_exp": pred_exp[idx],
-                "pred_max": pred_max[idx],
-                # 拆分F0-F4概率列
-                "prob_F0": probs[idx][0],
-                "prob_F1": probs[idx][1],
-                "prob_F2": probs[idx][2],
-                "prob_F3": probs[idx][3],
-                "prob_F4": probs[idx][4]
+                "true_label": true_label_np[idx],
+                "pred_exp": pred_exp_np[idx],
+                "pred_max": pred_max_np[idx],
+                # 此时提取出来的都是纯粹的 python float 浮点数，写入 CSV 绝对安全
+                "prob_F0": probs_np[idx][0],
+                "prob_F1": probs_np[idx][1],
+                "prob_F2": probs_np[idx][2],
+                "prob_F3": probs_np[idx][3],
+                "prob_F4": probs_np[idx][4]
             }
             self.test_predictions.append(pred_dict)
 

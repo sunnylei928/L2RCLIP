@@ -101,43 +101,65 @@ def main(cfg: DictConfig):
 
 def plot_metrics(output_dir):
     """
-    绘制 loss, accuracy 和 ROC 曲线
+    绘制训练过程中的 Loss 曲线和分类性能指标 (MAE)
     """
     output_path = Path(output_dir)
     csv_paths = list(output_path.rglob("metrics.csv"))
     
     if not csv_paths:
-        logger.warning(f"Metrics file not found in {output_dir}")
+        logger.warning(f"在 {output_dir} 中未找到指标文件")
         return
 
     csv_logger_path = csv_paths[-1]
-    logger.info(f"成功找到日志文件: {csv_logger_path}")
-
     metrics = pd.read_csv(csv_logger_path)
 
-    # L2RCLIP 的主要指标是 train_loss 和 val_loss (或者 val_mae)
-    train_loss = metrics.get("train/total_loss", pd.Series(dtype=float))
-    val_loss = metrics.get("val_loss", pd.Series(dtype=float))
+    # 1. 提取 Loss 指标 (对应你 CSV 中的表头)
+    train_loss = metrics.get("train/total_loss_epoch", pd.Series(dtype=float)).dropna().reset_index(drop=True)
+    val_loss = metrics.get("val_loss", pd.Series(dtype=float)).dropna().reset_index(drop=True)
+
+    # 2. 提取分类指标 (由于 CSV 没 Acc 列，我们用 mae_argmax 反映分类准确度)
+    # MAE (Argmax) 越低，代表分类准确率越高
+    train_mae_argmax = metrics.get("train_mae_argmax_metric_epoch", pd.Series(dtype=float)).dropna().reset_index(drop=True)
+    val_mae_argmax = metrics.get("val_mae_argmax_metric", pd.Series(dtype=float)).dropna().reset_index(drop=True)
+
+    # 创建一个包含两个子图的画布[cite: 4]
+    plt.figure(figsize=(10, 10))
+
+    # --- 子图 1: Loss 曲线 ---
+    plt.subplot(2, 1, 1)
+    if not train_loss.empty:
+        # 删掉末尾的
+        plt.plot(train_loss, label="Train Total Loss", color="#1f77b4", marker='o', markersize=4)
+    if not val_loss.empty:
+        # 删掉末尾的
+        plt.plot(val_loss, label="Validation Loss", color="#ff7f0e", marker='s', markersize=4)
+    plt.ylabel("Loss Value")
+    plt.title("Training and Validation Loss Over Epochs")
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.7)
+
+    # --- 子图 2: 分类性能 (MAE Argmax) ---
+    plt.subplot(2, 1, 2)
+    if not train_mae_argmax.empty:
+        # 删掉末尾的
+        plt.plot(train_mae_argmax, label="Train MAE (Argmax)", color="#2ca02c", marker='o', markersize=4)
+    if not val_mae_argmax.empty:
+        # 删掉末尾的
+        plt.plot(val_mae_argmax, label="Val MAE (Argmax)", color="#d62728", marker='s', markersize=4)
     
-    train_loss = train_loss.dropna().reset_index(drop=True)
-    val_loss = val_loss.dropna().reset_index(drop=True)
+    
+    plt.xlabel("Epoch")
+    plt.ylabel("MAE (Lower is Better)")
+    plt.title("Classification Error (MAE Argmax) Over Epochs")
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.7)
 
-    plt.figure(figsize=(10, 6))
-
-    if not train_loss.empty and not val_loss.empty:
-        plt.plot(train_loss, label="Train Loss", color="blue")
-        plt.plot(val_loss, label="Validation Loss", color="orange")
-        plt.xlabel("Epoch")
-        plt.ylabel("Loss")
-        plt.title("L2RCLIP Training & Validation Loss Curve")
-        plt.legend()
-        plt.grid()
-
+    # 保存最终图像[cite: 4]
     plt.tight_layout()
-    save_path = Path(output_dir) / "training_metrics.png"
-    plt.savefig(save_path)
+    save_path = output_path / "training_metrics.png"
+    plt.savefig(save_path, dpi=150)
     plt.close()
-    logger.info(f"📊 训练指标曲线图已成功保存至: {save_path.absolute()}")
+    logger.info(f"📊 指标综合曲线图已保存至: {save_path.absolute()}")
 
 
 def generate_analysis_report(output_dir):
@@ -181,12 +203,17 @@ def load_loggers(output_dir):
     output_dir = Path(output_dir)
     output_dir.mkdir(exist_ok=True, parents=True)
     (output_dir / "csv_logger").mkdir(exist_ok=True, parents=True)
+    loggers = []
 
-    loggers = [
-        pl_loggers.CSVLogger(str(output_dir), name="csv_logger", version="")
-    ]
+    loggers.append(
+        pl_loggers.CSVLogger(
+            str(output_dir),
+            name="csv_logger",
+            version=""
+        )
+    )
+
     return loggers
-
 
 def load_callbacks(output_dir):
     output_dir = Path(output_dir)
@@ -280,7 +307,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", "-c", action="append", type=str, default=[])
     parser.add_argument("--seed", "-s", type=int, default=42)
-    parser.add_argument("--output_dir", type=str, default="./outputs")
+    parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--test_only", action="store_true", default=False)
     parser.add_argument("--debug", action="store_true", default=False)
     parser.add_argument("--verbose", action="store_true", default=False)

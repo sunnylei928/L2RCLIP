@@ -114,7 +114,7 @@ data_cfg:
     num_workers: 8
     batch_size: 32           # 【建议】对比学习需要稍微大一点的 Batch Size，如果显存不够改回 16
     shuffle: true            # 注意：在 Dataloader 里如果你用了 RandomIdentitySampler，这里的 shuffle 会被 sampler 覆盖
-    num_instances: 4         # 【L2RCLIP 新增】给 RandomIdentitySampler 使用，保证每个 Batch 内同等级图片数量
+
   eval_dataloder_cfg:
     num_workers: 8
     batch_size: 32
