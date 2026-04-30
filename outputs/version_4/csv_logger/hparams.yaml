@@ -1,0 +1,64 @@
+model_cfg:
+  type: OrdinalCLIP
+  prompt_learner_cfg:
+    type: RankPromptLearner
+    num_ranks: 5
+    num_base_ranks: 5
+    num_tokens_per_rank: 1
+    num_context_tokens: 20
+    rank_tokens_position: tail
+    init_rank_path: null
+    init_context: A medical ultrasound image of a liver, the fibrosis stage is
+    rank_specific_context: true
+    interpolation_type: linear
+  text_encoder_name: RN50
+  image_encoder_name: resnet50
+output_dir: outputs/version_4
+optimizer_and_scheduler_cfg:
+  param_dict_cfg:
+    lr_prompt_learner_context: 0.0001
+    lr_prompt_learner_ranks: 0.0001
+    lr_rankformer: 0.0001
+    lr_image_encoder: 1.0e-05
+    lr_text_encoder: 0.0
+    lr_logit_scale: 0.0
+    staged_lr_image_encoder:
+      new_layers: []
+      base_lr_mult: 1.0
+      new_lr_mult: 1.0
+  optimizer_cfg:
+    optimizer_name: radam
+    lr: 1.0e-05
+    weight_decay: 0.01
+    momentum: 0.9
+    sgd_dampening: 0.0
+    sgd_nesterov: false
+    rmsprop_alpha: 0.99
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    staged_lr: null
+    lookahead: false
+  lr_scheduler_cfg:
+    lr_scheduler_name: cosine
+    stepsize:
+    - 60
+    gamma: 0.1
+    max_epochs: 50
+    warmup_epoch: 5
+    warmup_cons_lr: 1.0e-05
+    warmup_min_lr: 1.0e-05
+    warmup_type: linear
+    warmup_recount: true
+load_weights_cfg:
+  init_model_weights: null
+  init_prompt_learner_weights: null
+  init_image_encoder_weights: /home/ubuntu/lq/OrdinalCLIP/.cache/resnet/resnet50-19c8e357.pth
+  init_text_encoder_weights: null
+seed: 42
+loss_weights:
+  ce_loss: 1.0
+  kl_loss: 0.0
+  cop_loss: 1.0
+  mse_loss: 0.0
+stage2_start_epoch: 10
+ckpt_path: ''
