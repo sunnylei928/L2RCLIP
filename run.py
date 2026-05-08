@@ -263,7 +263,7 @@ def load_callbacks(output_dir):
         EarlyStopping(
             monitor="val_loss",
             min_delta=0.00,
-            patience=20,
+            patience=30,  # 【修改】增加耐心，给PromptLearner更充分的学习时间
             verbose=True,
             mode="min"
         )

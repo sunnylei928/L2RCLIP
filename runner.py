@@ -9,15 +9,14 @@ from typing import Dict, List, Any
 import numpy as np
 sys.path.insert(0, '/home/ubuntu/lq/OrdinalCLIP')
 
-from ordinalclip.models import MODELS
-
 from ordinalclip.utils.logging import get_logger
 from ordinalclip.runner.optim.lr_scheduler import build_lr_scheduler
 from ordinalclip.runner.optim.optimizer import build_optimizer
-from ordinalclip.runner.utils import freeze_param, load_pretrained_weights
+from ordinalclip.runner.utils import load_pretrained_weights
 
 import matplotlib.pyplot as plt
 from losses.l2r_losses import L2RLosses
+from models.ordinalclip import OrdinalCLIP
 
 logger = get_logger(__name__)
 
@@ -35,69 +34,18 @@ class L2RCLIPRunner(pl.LightningModule):
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
-        
+
         # 这里哪怕加载了旧的 OrdinalCLIP 也没关系
-        self.module = MODELS.build(model_cfg)
+        # 不修改，直接实例化内部 OrdinalCLIP，不通过外部 MODELS.build()
+        # 之前 MODELS.build() 实际调用的是外部 OrdinalCLIP 仓库的代码，这里修改后全部生效
+        model_cfg_dict = dict(model_cfg)
+        model_cfg_dict.pop("type", None)
+        self.module = OrdinalCLIP(**model_cfg_dict)
         self.loss_weights = loss_weights
         self.num_ranks = getattr(self.module, "num_ranks", 5) 
 
-        # =====================================================================
-        # 🚀 终极自愈补丁：动态强行注入 L2RPromptLearner (无视路径冲突)
-        # =====================================================================
-        if not hasattr(self.module.prompt_learner, "rankformer"):
-            logger.warning("⚠️ 检测到模型加载了旧版 PromptLearner，正在启动动态替换...")
-            
-            # 1. 确保能从你当前的新项目里导入 L2RPromptLearner
-            import sys
-            if '/home/ubuntu/lq/L2RCLIP' not in sys.path:
-                sys.path.append('/home/ubuntu/lq/L2RCLIP')
-            from models.prompt_learner import L2RPromptLearner
-            
-            # 2. 抓取底层的 CLIP 实例和特征维度
-            internal_clip = getattr(self.module, "clip_model", getattr(self.module, "model", None))
-            
-            # 👇 【关键新增：防丢机制】如果旧模型把它丢了，我们当场加载一个用来提取词向量
-            if internal_clip is None:
-                import clip
-                # 尝试从配置获取 backbone 名字，默认兜底使用 ViT-B/16
-                backbone_name = model_cfg.get("text_encoder_name", "ViT-B/16")
-                logger.info(f"🔄 旧版代码未保存 CLIP 实例，正从本地缓存加载 {backbone_name} 提取医学词嵌入...")
-                internal_clip, _ = clip.load(backbone_name, device="cpu")
-                internal_clip.float() # 保持数据类型一致
-            # 👆 =======================================================================
-            
-            embed_dims = getattr(self.module, "embed_dims", 512)
-            
-            # 3. 强行覆盖为你的医学医学先验学习器
-            self.module.prompt_learner = L2RPromptLearner(
-                clip_model=internal_clip, 
-                num_ranks=self.num_ranks, 
-                embeddings_dim=embed_dims
-            )
-            
-            # 4. 同步 Token 供外部 TextEncoder 提取句尾 [EOT]
-            self.module.psudo_sentence_tokens = self.module.prompt_learner.psudo_sentence_tokens
-            
-            # 5. 动态截断 TextEncoder 的位置编码 (解决 17 vs 77 的 RuntimeError)
-            seq_len = self.module.psudo_sentence_tokens.shape[1]
-            orig_pos = self.module.text_encoder.positional_embedding
-            if orig_pos.shape[0] != seq_len:
-                logger.info(f"✂️ 正在动态截断位置编码 ({orig_pos.shape[0]} -> {seq_len}) 以完美匹配医学 Prompt...")
-                self.module.text_encoder.positional_embedding = torch.nn.Parameter(
-                    orig_pos[:seq_len, :].clone()
-                )
-#                👇 【关键新增：解决 77x77 报错】同步截断所有 Transformer 层的 Attention Mask
-                if hasattr(self.module.text_encoder, "transformer"):
-                    for block in self.module.text_encoder.transformer.resblocks:
-                        if hasattr(block, "attn_mask") and block.attn_mask is not None:
-                            block.attn_mask = block.attn_mask[:seq_len, :seq_len]
-                # 👆 ===============================================================
-                
-            logger.info("✅ 动态替换成功！RankFormer 和医学先验 (F0-F4) 已全副武装上线。")
-        else:
-            logger.info("✅ 原生装配成功！已检测到 RankFormer。")
-        # =====================================================================
-        
+        logger.info("内部 OrdinalCLIP 加载成功，使用修改后的 dropout 和 TextEncoder")
+
         self.register_buffer("rank_output_value_array", torch.arange(0, self.num_ranks).float(), persistent=False)
         self.output_dir = Path(output_dir)
         self._custom_logger = get_logger(__name__)
@@ -113,23 +61,32 @@ class L2RCLIPRunner(pl.LightningModule):
     def on_train_epoch_start(self) -> None:
         """
         严格复现论文的两阶段训练策略:
-        Stage 1: 冻结 Image Encoder，训练 PromptLearner 和 RankFormer。
-        Stage 2: 解冻 Image Encoder，进行全局序数对齐微调。
+        Stage 1: 冻结 Image Encoder，训练 PromptLearner 和 RankFormer
+        Stage 2: 解冻 Image Encoder，进行全局序数对齐微调
         """
-        # 获取配置中的开启时间
         stage2_start = self.hparams.stage2_start_epoch
-        
-        if hasattr(self.module, "image_encoder"):
-            if self.current_epoch < stage2_start:
-                # Stage 1: 保持视觉特征稳定
-                self.module.image_encoder.requires_grad_(False)
+
+        if not hasattr(self.module, "image_encoder"):
+            return
+
+        image_encoder = self.module.image_encoder
+
+        if self.current_epoch < stage2_start:
+            # Stage 1: 冻结视觉编码器
+            if image_encoder.training:  # 仅在首次进入时设置，避免重复操作
+                image_encoder.requires_grad_(False)
+                image_encoder.eval()  # 同时设为 eval 模式，防止 BN/Dropout 更新
                 if self.current_epoch == 0:
-                    logger.info(f"🛡️ [Stage 1] Epoch {self.current_epoch}: 视觉编码器已锁定。")
-            else:
-                # Stage 2: 开启跨模态微调
-                self.module.image_encoder.requires_grad_(True)
-                if self.current_epoch == stage2_start:
-                    logger.info(f"🔥 [Stage 2] Epoch {self.current_epoch}: 视觉编码器已解冻。")
+                    logger.info(f"[Stage 1] Epoch {self.current_epoch}: 视觉编码器已锁定 (requires_grad=False)")
+        else:
+            # Stage 2: 解冻视觉编码器
+            if not image_encoder.training:  # 仅在切换时设置
+                image_encoder.requires_grad_(True)
+                image_encoder.train()  # 恢复训练模式
+                logger.info(f"[Stage 2] Epoch {self.current_epoch}: 视觉编码器已解冻 (requires_grad=True)")
+
+                # 关键: 优化器在一开始就已包含 image_encoder 参数（见 build_param_dict），
+                # 因此解冻后无需重新初始化优化器，Adam 的动量缓冲区和学习率调度器状态得以保留。
 
     def run_step(self, batch, batch_idx, step_type: str = "train"):
         """
@@ -153,7 +110,7 @@ class L2RCLIPRunner(pl.LightningModule):
         # 计算评估指标 (MAE)
         metrics_exp = self.compute_per_example_metrics(logits, y, "exp")
         metrics_argmax = self.compute_per_example_metrics(logits, y, "argmax")
-        
+
         # 测试阶段收集预测结果（含F0-F4概率）
         if step_type == "test":
             self.collect_test_predictions(logits, y)
@@ -167,7 +124,7 @@ class L2RCLIPRunner(pl.LightningModule):
 
     def compute_losses(self, logits, img_feats, txt_feats, y):
         losses = {}
-        
+
         # 1. Asymmetrical Contrastive Loss
         # 对应论文：允许一图对多文，增强语义鲁棒性
         if self.loss_weights.get("ce_loss", 0) > 0:
@@ -181,6 +138,14 @@ class L2RCLIPRunner(pl.LightningModule):
             losses["cop_loss"] = L2RLosses.ordinal_pairwise_loss(
                 logits, img_feats, txt_feats, y, self.num_ranks
             )
+        # 3. 新增：文本特征分散损失，防止5个等级的文本特征坍缩到同一个点
+        # 当文本特征平均余弦相似度 > 0.5 时触发损失，使其互相远离
+        if self.loss_weights.get("dispersion_loss", 0) > 0:
+            txt_feats_norm = F.normalize(txt_feats, dim=-1)
+            sim_matrix = txt_feats_norm @ txt_feats_norm.t()  # (5, 5)
+            mask = torch.triu(torch.ones_like(sim_matrix), diagonal=1).bool()
+            avg_sim = sim_matrix[mask].mean()
+            losses["dispersion_loss"] = torch.relu(avg_sim - 0.5)
 
         return losses
 
@@ -190,14 +155,14 @@ class L2RCLIPRunner(pl.LightningModule):
         :param logits: 模型输出的原始logits
         :param y: 真实标签
         """
-        # 1. 纯 Tensor 计算阶段（速度最快，全在同一设备上运算）
-        probs_tensor = F.softmax(logits, dim=-1)  # 保持为 Tensor
+        # 1. 保持 Tensor 计算阶段（速度最快，全在同一设备上运算）
+        probs_tensor = F.softmax(logits, dim=-1)  # 保持 Tensor
         rank_values = self.rank_output_value_array.type(logits.dtype)
-        
+
         pred_exp_tensor = torch.sum(probs_tensor * rank_values, dim=-1)
         pred_max_tensor = torch.argmax(logits, dim=-1)
-        
-        # 2. 统一转换为 Numpy 阶段（准备提取纯数字）
+
+        # 2. 统一转换到 Numpy 阶段（准备提取纯数字）
         probs_np = probs_tensor.detach().cpu().numpy()
         pred_exp_np = pred_exp_tensor.detach().cpu().numpy()
         pred_max_np = pred_max_tensor.detach().cpu().numpy()
@@ -226,7 +191,7 @@ class L2RCLIPRunner(pl.LightningModule):
         """
         probs = F.softmax(logits, -1)
         rank_values = self.rank_output_value_array.type(logits.dtype)
-        
+
         # 使用期待值计算连续等级
         if gather_type == "exp":
             predict_y = torch.sum(probs * rank_values, dim=-1)
@@ -260,6 +225,18 @@ class L2RCLIPRunner(pl.LightningModule):
                 self.log(f"val_{k}", v, on_step=False, on_epoch=True, prog_bar=True)
             if "metric" in k:
                 self.log(f"val_{k}", v, on_step=False, on_epoch=True, prog_bar=True)
+
+        # 新增：监控文本特征区分度，计算5个等级文本特征的平均余弦相似度
+        # 如果文本特征坍缩，此值会接近1.0；正常应在 0.3-0.8 之间
+        with torch.no_grad():
+            _, _, txt_feats = self.module(batch[0][:1])  # 取1张图触发forward获取txt_feats
+            txt_feats = txt_feats / (txt_feats.norm(dim=-1, keepdim=True) + 1e-6)
+            sim_matrix = txt_feats @ txt_feats.t()  # (5, 5)
+            # 排除对角线，计算上三角平均
+            mask = torch.triu(torch.ones_like(sim_matrix), diagonal=1).bool()
+            avg_sim = sim_matrix[mask].mean()
+            self.log("val_text_feature_avg_cosine", avg_sim, on_step=False, on_epoch=True, prog_bar=False)
+
         return outputs
 
     def test_step(self, batch, batch_idx):
@@ -274,15 +251,15 @@ class L2RCLIPRunner(pl.LightningModule):
     def on_test_epoch_end(self):
         """测试 epoch 结束后：保存包含F0-F4概率的预测结果到 CSV 文件"""
         if not self.test_predictions:
-            logger.warning("测试阶段未收集到任何预测结果！")
+            logger.warning("测试阶段未收集到任何预测结果")
             return
-        
+
         # 保存预测结果到 output_dir
         pred_df = pd.DataFrame(self.test_predictions)
         save_path = self.output_dir / "test_predictions.csv"
         pred_df.to_csv(save_path, index=False)
-        logger.info(f"📝 测试预测结果（含F0-F4概率）已保存至: {save_path.absolute()}")
-        
+        logger.info(f"测试预测结果（含F0-F4概率）已保存至: {save_path.absolute()}")
+
         # 重置预测结果列表（避免多轮测试重复）
         self.test_predictions = []
 
@@ -296,24 +273,24 @@ class L2RCLIPRunner(pl.LightningModule):
 
     def build_param_dict(self, **kwargs):
         param_dict_ls = []
-        
+
         # 1. 提示词上下文参数
         if kwargs.get("lr_prompt_learner_context", 0) > 0 and hasattr(self.module.prompt_learner, "context_embeds"):
             param_dict_ls.append({
-                "params": [self.module.prompt_learner.context_embeds], # ✅ 加上 []
+                "params": [self.module.prompt_learner.context_embeds],  # 注意加上 []
                 "lr": kwargs["lr_prompt_learner_context"], 
                 "name": "prompt_context"
             })
-        
+
         # 2. 基础等级嵌入参数
         if kwargs.get("lr_prompt_learner_ranks", 0) > 0 and hasattr(self.module.prompt_learner, "rank_embeds"):
             param_dict_ls.append({
-                "params": [self.module.prompt_learner.rank_embeds], # ✅ 加上 []
+                "params": [self.module.prompt_learner.rank_embeds],  # 注意加上 []
                 "lr": kwargs["lr_prompt_learner_ranks"], 
                 "name": "prompt_ranks"
             })
 
-        # 3. 【核心】RankFormer 参数注入
+        # 3. 核心：RankFormer 参数注入
         if hasattr(self.module.prompt_learner, 'rankformer'):
             lr_rf = kwargs.get("lr_rankformer", kwargs.get("lr_prompt_learner_ranks", 0.0001))
             param_dict_ls.append({
@@ -323,16 +300,21 @@ class L2RCLIPRunner(pl.LightningModule):
             })
 
         # 4. 视觉编码器参数 (Stage 2 使用，增加属性存在性检查)
-        if kwargs.get("lr_image_encoder", 0) > 0 and hasattr(self.module, "image_encoder"):
+        # 关键修正：无论 Stage 1 是否需要训练，都先将视觉编码器参数加入优化器。
+        # 两阶段冻结仅通过 requires_grad_ 控制，避免 Stage 2 中途重新初始化优化器
+        # 导致学习率状态、动量缓冲区丢失（尤其影响 Adam 类优化器）。
+        if hasattr(self.module, "image_encoder"):
+            lr_ie = kwargs.get("lr_image_encoder", 0.0)
+            # 若未配置 image_encoder 学习率，继承 prompt_learner_context 的学习率作为保底
+            if lr_ie <= 0:
+                lr_ie = kwargs.get("lr_prompt_learner_context", 1e-4)
+
             param_dict_ls.append({
                 "params": self.module.image_encoder.parameters(), 
-                "lr": kwargs["lr_image_encoder"], 
+                "lr": lr_ie, 
                 "name": "image_encoder"
             })
-        else:
-            if hasattr(self.module, "image_encoder"):
-                freeze_param(self.module.image_encoder)
-            
+
         return param_dict_ls
 
     def load_weights(self, **kwargs):

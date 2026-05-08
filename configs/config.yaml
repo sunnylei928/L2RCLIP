@@ -2,7 +2,7 @@ runner_cfg:
   seed: 42
   # 输出目录修改为 l2rclip 专属目录，避免与 baseline 冲突
   output_dir: /home/ubuntu/lq/L2RCLIP_results/fold_0
-  stage2_start_epoch: 10  # 【L2RCLIP 新增】第10个epoch解锁视觉编码器（两阶段微调）
+  stage2_start_epoch: 25  # 【修改】推迟到25 epoch解冻，先让PromptLearner充分学习
   
   optimizer_and_scheduler_cfg:
     param_dict_cfg:
@@ -33,7 +33,7 @@ runner_cfg:
       stepsize:
         - 60
       gamma: 0.1
-      max_epochs: 50             # 与 trainer_cfg 保持一致
+      max_epochs: 100            # 【修改】与 trainer_cfg 保持一致
       warmup_epoch: 5            # 【修改】加入 5 个 epoch 的 Warmup，保护随机初始化的 RankFormer
       warmup_cons_lr: 1.0e-05
       warmup_min_lr: 1.0e-05
@@ -50,7 +50,8 @@ runner_cfg:
     # 【L2RCLIP 核心修改】切换为 L2RCLIP 的双重损失
     ce_loss: 1.0       # 对应 Asymmetrical Contrastive Loss (SupConLoss)
     kl_loss: 0.0       # 关闭原始 OrdinalCLIP 的 KL 散度损失
-    cop_loss: 1.5      # 【L2RCLIP 新增】对应 Cross-modal Ordinal Pairwise Loss (L_cop)
+    cop_loss: 0.0      # 【修改】暂时关闭 cop_loss，先验证 ce_loss baseline 是否正常
+    dispersion_loss: 1.0  # 【新增】防止文本特征坍缩，当5个等级文本特征相似度>0.5时产生惩罚
     mse_loss: 0.0
     
   model_cfg:
@@ -69,6 +70,7 @@ runner_cfg:
       interpolation_type: linear
     text_encoder_name: RN50
     image_encoder_name: resnet50
+    dropout_rate: 0.1
 
 data_cfg:
   train_images_root: /home/ubuntu/lq/OrdinalCLIP/data/LF
@@ -121,7 +123,7 @@ data_cfg:
     shuffle: false
 
 trainer_cfg:
-  max_epochs: 50             # 训练轮数
+  max_epochs: 100            # 【修改】增加训练轮数，给PromptLearner更多学习时间
   precision: 16              # 使用半精度，加快速度省显存
   accelerator: gpu
   devices: 1
